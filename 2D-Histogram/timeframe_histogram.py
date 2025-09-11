@@ -1,5 +1,6 @@
 import sys
-sys.path.append("/Users/yemingcn/Desktop/my_code/timeframe_histogram/v1")
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), "utils"))
 
 
 from copy import copy
@@ -24,6 +25,20 @@ from utils.util import (
     get_datetime_field,
     get_unix_time_field,
 )
+
+def calculate_precision_aware_bins(ylim, ynum, yprecision):
+    """Calculate y-axis bins with precision awareness."""
+    ylogbins = np.logspace(np.log10(ylim[0]), np.log10(ylim[1]), num=int(ynum))
+    logpart = ylogbins[~(np.diff(ylogbins, prepend=[True]) < yprecision)]
+    if logpart.size > 0:
+        linpart = np.linspace(
+            ylim[0],
+            logpart.min() - yprecision,
+            int(np.floor((logpart.min() - ylim[0]) / yprecision)),
+        )
+        return np.concatenate([linpart, logpart])
+    else:
+        return np.linspace(ylim[0], ylim[1], num=int(ynum))
 
 def common_histogram_setup(ax, title, xlabel, ylabel):
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
@@ -60,26 +75,11 @@ def plot_histogram(
         # yprecision = ylim[0]
         # TODO - that seems to be broken.  We need better auto-precision.
         yprecision = 1
-    ylogbins = np.logspace(np.log10(ylim[0]), np.log10(ylim[1]), num=int(ynum))
-    # Now, we must take into account precision:
-    # Since precision is typically fixed (precision does not
-    # scale-up or scale-down depending on value measured) we have a "floor"
-    # on bin size limited by the precision. Split the logbins into a
-    # "linear" part and "log" part if the lower bound on precision is
-    # violated:
-    logpart = ylogbins[~(np.diff(ylogbins, prepend=[True]) < yprecision)]
-    if logpart.size > 0:
-        linpart = np.linspace(
-            ylim[0],
-            logpart.min() - yprecision,
-            int(np.floor((logpart.min() - ylim[0]) / yprecision)),
-        )
-        ylogbins = np.concatenate([linpart, logpart])
-    else:
-        ylogbins = np.linspace(ylim[0], ylim[1], num=int(ynum))
+    ylogbins = calculate_precision_aware_bins(ylim, ynum, yprecision)
 
-    xnum = min(800, np.max(x) - np.min(x))
-    xbins = np.linspace(np.min(x), np.max(x), num=int(xnum))
+    x_min, x_max = np.min(x), np.max(x)
+    xnum = min(800, x_max - x_min)
+    xbins = np.linspace(x_min, x_max, num=int(xnum))
 
     # 2D histogram
     h, xedges, yedges = np.histogram2d(x, y, bins=[xbins, ylogbins])
@@ -89,8 +89,8 @@ def plot_histogram(
     )
     try:
         fig.colorbar(pcm, ax=ax, pad=0)
-    except Exception as e:
-        logger.log_err(f"execption e = {e}")
+    except (ValueError, RuntimeError) as e:
+        logger.log_err(f"Failed to create colorbar: {type(e).__name__}: {e}")
 
     ax.set_yscale(yscale)
     common_histogram_setup(ax, title, xlabel="Time", ylabel=metric)
@@ -98,6 +98,18 @@ def plot_histogram(
 def plot_timestamp_vline(ax, ts, color="r"):
     vline = pd.to_datetime(ts).timestamp()
     ax.axvline(vline, color=color)
+
+def _process_group_data(group, metric, resample_size, datetime_field, stats):
+    """Helper function to process group data and create aggregations."""
+    r = group.dropna(subset=[metric]).resample(resample_size, on=datetime_field)
+    agg_dict = {metric: []}
+    for stat in stats:
+        stat_name = "size" if stat == "n" else stat
+        agg_dict[metric].append((stat_name.lower(), create_stat_function(stat_name)))
+    
+    tm99_data = r.agg(agg_dict)
+    tm99_data.columns = tm99_data.columns.get_level_values(1)
+    return tm99_data
 
 def plot_metrics(
     ax,
@@ -112,28 +124,20 @@ def plot_metrics(
     datetime_field = datetime_field or get_datetime_field(df.columns)
     df = process_datetime_field(df, convert_datetime_field, datetime_field)
 
-
     if group_by is not None:
         grouped_df = df.groupby(group_by)
     else:
         grouped_df = [("", df)]
 
+    ax2 = None
     for group_name, group in grouped_df:
         current_label = f"{label} {group_name}" if label else group_name
-
-        r = group.dropna(subset=[metric]).resample(resample_size, on=datetime_field)
-        agg_dict = {metric: []}
-        for stat in stats:
-            if stat == "n":
-                stat = "size"
-            agg_dict[metric].append((stat.lower(), create_stat_function(stat)))
-
-        tm99_data = r.agg(agg_dict)
-        tm99_data.columns = tm99_data.columns.get_level_values(1)
+        tm99_data = _process_group_data(group, metric, resample_size, datetime_field, stats)
 
         for stat in stats:
             if stat == "n":
-                ax2 = ax.twinx()
+                if ax2 is None:
+                    ax2 = ax.twinx()
                 ax2.plot(
                     tm99_data.index,
                     tm99_data["size"],
@@ -156,6 +160,45 @@ def plot_metrics(
     ax.legend(loc="upper left")
     ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d %H:%M:%S"))
 
+def _prepare_aggregated_data(group, metric, resample_size, datetime_field, stats):
+    """Helper function to prepare aggregated data for plotting."""
+    r = group.dropna(subset=[metric]).resample(resample_size, on=datetime_field)
+    agg_dict = {metric: []}
+    for stat in stats:
+        stat_name = "size" if stat == "n" else stat
+        agg_dict[metric].append((stat_name.lower(), create_stat_function(stat_name)))
+    
+    tm99_data = r.agg(agg_dict)
+    tm99_data.columns = tm99_data.columns.get_level_values(1)
+    return tm99_data
+
+def _plot_stat_data(ax, ax2, tm99_data, stat, current_label):
+    """Helper function to plot individual stat data."""
+    if stat == "n":
+        if ax2 is None:
+            ax2 = ax.twinx()
+        ax2.plot(
+            tm99_data.index,
+            tm99_data["size"],
+            color="aqua",
+            linewidth=3,
+            alpha=0.7,
+            label=f"{current_label} Count",
+        )
+        max_size = np.max(tm99_data["size"])
+        ax2.set_ylim([0, max_size + max_size * 0.1])
+        ax2.legend(loc="upper right")
+        ax2.ticklabel_format(style="plain", axis="y")
+    else:
+        ax.plot(
+            tm99_data.index,
+            tm99_data[stat.lower()],
+            linewidth=3,
+            alpha=0.7,
+            label=f"{current_label} {stat}",
+        )
+    return ax2
+
 def plot_metrics_1(
     ax,
     df,
@@ -174,42 +217,13 @@ def plot_metrics_1(
     else:
         grouped_df = [("", df)]
 
+    ax2 = None
     for group_name, group in grouped_df:
         current_label = f"{label} {group_name}" if label else group_name
-
-        r = group.dropna(subset=[metric]).resample(resample_size, on=datetime_field)
-        agg_dict = {metric: []}
-        for stat in stats:
-            if stat == "n":
-                stat = "size"
-            agg_dict[metric].append((stat.lower(), create_stat_function(stat)))
-
-        tm99_data = r.agg(agg_dict)
-        tm99_data.columns = tm99_data.columns.get_level_values(1)
+        tm99_data = _prepare_aggregated_data(group, metric, resample_size, datetime_field, stats)
 
         for stat in stats:
-            if stat == "n":
-                ax2 = ax.twinx()
-                ax2.plot(
-                    tm99_data.index,
-                    tm99_data["size"],
-                    color="aqua",
-                    linewidth=3,
-                    alpha=0.7,
-                    label=f"{current_label} Count",
-                )
-                ax2.set_ylim([0, np.max(tm99_data["size"]) + np.max(tm99_data["size"]) * 0.1])
-                ax2.legend(loc="upper right")
-                ax2.ticklabel_format(style="plain", axis="y")
-            else:
-                ax.plot(
-                    tm99_data.index,
-                    tm99_data[stat.lower()],
-                    linewidth=3,
-                    alpha=0.7,
-                    label=f"{current_label} {stat}",
-                )
-                # ax.ticklabel_format(style="plain", axis="y")
+            ax2 = _plot_stat_data(ax, ax2, tm99_data, stat, current_label)
 
     ax.legend(loc="upper left")
     ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d %H:%M:%S"))

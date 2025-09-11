@@ -1,6 +1,7 @@
 import pandas as pd
 import re
 import psutil
+import html
 from typing import List, Tuple, Union, cast
 from dateutil import parser
 from scipy import stats
@@ -23,17 +24,21 @@ def format_ms(y, pos=None):
 
 def format_unix_timestamp(x, pos=None):
     ts = pd.to_datetime(x, unit="s")
-    return ts.strftime("%Y-%m-%d %H:%M:%S")
+    formatted_time = ts.strftime("%Y-%m-%d %H:%M:%S")
+    return html.escape(formatted_time)
 
 def convert_datetime_field(timefield_data):
     if pd.api.types.is_numeric_dtype(timefield_data):
         return pd.to_datetime(timefield_data, unit="s")
 
     elif pd.api.types.is_string_dtype(timefield_data):
-        return timefield_data.apply(lambda x: parser.parse(x))
+        return pd.to_datetime(timefield_data)
 
     elif pd.api.types.is_datetime64_any_dtype(timefield_data):
         return timefield_data
+    
+    else:
+        raise ValueError(f"Unsupported data type for datetime conversion: {timefield_data.dtype}")
         
 
 def convert_to_unix_timestamp(timefield_data):
@@ -43,6 +48,11 @@ def convert_to_unix_timestamp(timefield_data):
     elif pd.api.types.is_string_dtype(timefield_data):
         timefield_data = timefield_data.apply(lambda x: parser.parse(x))
 
+    elif pd.api.types.is_datetime64_any_dtype(timefield_data):
+        pass  # Already datetime, continue to conversion
+    else:
+        raise ValueError(f"Unsupported data type for timestamp conversion: {timefield_data.dtype}")
+
     if not pd.api.types.is_datetime64_any_dtype(timefield_data):
         timefield_data = pd.to_datetime(timefield_data)
 
@@ -50,6 +60,8 @@ def convert_to_unix_timestamp(timefield_data):
 
 def process_datetime_field(df, convert_func, datetime_field=None):
     if datetime_field:
+        if datetime_field not in df.columns:
+            raise ValueError(f"Datetime field '{datetime_field}' not found in DataFrame columns: {list(df.columns)}")
         df.loc[:, datetime_field] = convert_func(df[datetime_field])
     else:
         raise ValueError(
@@ -69,6 +81,7 @@ def get_datetime_field(columns):
     return None
 
 def get_unix_time_field(columns):
-    for field in ["timestamp", "TimeEpoch", "DateTime"]:
+    for field in ["DateTime", "timestamp", "TimeEpoch"]:
         if field in columns:
             return field
+    return None
